@@ -1,15 +1,18 @@
 import torch.nn as nn
 import torch.nn.functional as F
-import einops
 import torch
 from functools import partial
 import sys
+from pathlib import Path
 from timm.models.vision_transformer import Block
 
 import src.utils as utils
 
-global_path = "/home/edabier/Documents/Thèse/benchmark"
-sys.path.append(global_path)
+cwd = Path.cwd()
+global_path = cwd.parent
+
+sys.path.append(f"{global_path}")
+from spectral_earth.src.backbones import spec_vit
 
 sys.path.append(f"{global_path}/DOFA")
 from wave_dynamic_layer import Dynamic_MLP_OFA
@@ -80,65 +83,28 @@ class OFAViT(nn.Module):
         x = self.forward_head(x)
         return x
 
-def create_dofa(Y, c=None, size="base", version="v2", path="path/to/weights"):
+def create_dofa(Y, A, path="path/to/checkpoints"):
     batch, B, H, _ = Y.shape
     device = Y.device
 
     if H < 224:
         Y = F.interpolate(Y, size=(224,224))
+        A = F.interpolate(A, size=(224,224))
         new_H = 224
     else:
         new_H = 224
     Y = Y[:,:,:new_H, :new_H]
+    A = A[:,:,:new_H, :new_H]
 
-    if size == "base":
-        out_indices = [11]
-    elif size == "large":
-        out_indices = [23]
+    check_point = torch.load(f"{path}/DOFA_ViT_large_e100.pth", map_location=device)
+    fm = OFAViT(
+        img_size=224, patch_size=16, embed_dim=1024, depth=24, num_heads=16, out_indices=[23], mlp_ratio=4,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6))
+    fm.load_state_dict(check_point, strict=False)
 
-    if size == "large":
-        if version == "v2":
-            check_point = torch.load(path, map_location=device)
-            check_model = {
-                k[len("model."):]: v
-                for k, v in check_point.items()
-                if k.startswith("model.")
-            }
-            fm = OFAViT(
-                img_size=224, patch_size=14, embed_dim=1024, depth=24, num_heads=16, out_indices=out_indices, mlp_ratio=4,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            fm.load_state_dict(check_point, strict=False)
-            fm.load_state_dict(check_model, strict=False)
-        else:
-            check_point = torch.load(path, map_location=device)
-            fm = OFAViT(
-                img_size=224, patch_size=16, embed_dim=1024, depth=24, num_heads=16, out_indices=out_indices, mlp_ratio=4,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            fm.load_state_dict(check_point, strict=False)
+    return fm, Y, A, new_H
 
-    elif size == "base":
-        if version == "v2":
-            check_point = torch.load(path, map_location=device)
-            check_model = {
-                k[len("model."):]: v
-                for k, v in check_point.items()
-                if k.startswith("model.")
-            }
-            fm = OFAViT(
-                img_size=224, patch_size=14, embed_dim=768, depth=12, num_heads=12, out_indices=out_indices, mlp_ratio=4,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            fm.load_state_dict(check_point, strict=False)
-            fm.load_state_dict(check_model, strict=False)
-        else:
-            check_point = torch.load(path, map_location=device)
-            fm = OFAViT(
-                img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12, out_indices=out_indices, mlp_ratio=4,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6))
-            fm.load_state_dict(check_point, strict=False)
-    
-    return fm, Y, new_H
-
-def extract_features(fm, Y, wavelengths):
+def extract_features(dofa, Y, wavelengths):
     batch, B, H, _ = Y.shape
 
     if H < 224:
@@ -148,11 +114,40 @@ def extract_features(fm, Y, wavelengths):
         new_H = 224
     Y = Y[:,:,:new_H, :new_H]
     
-    features = fm.forward_features(Y, wavelengths)
+    features = dofa.forward_features(Y, wavelengths)
     
-    return features
+    return utils.oneD_to_2d(features)
 
-class Weight_constraint(object):
+def create_spectralearth(device, path="path/to/checkpoints"):
+
+    fm = spec_vit.SpecViTBase() # or small, large, huge...
+    checkpoint = torch.load(f"{path}/spec_ViTb_mae.pth", map_location=device)
+
+    fm.load_state_dict(checkpoint, strict=False)
+
+    return fm
+
+def spectral_adapter(spectralearth, Y):
+    adapter = spectralearth.spectral_adapter
+    Y_adapted = adapter(Y)
+
+    return Y_adapted
+
+def init_decoder_weights(model, Y, c):
+    """
+    Initializes the model's decoder weights with SiVM's extracted endmembers
+    input Y must be of shape (B, N) or (B, H, W) -> no batch
+    """
+
+    init_em = utils.SiVM(Y, c)
+
+    model_dict = model.decoder.state_dict() 
+    model_dict["decoder.weight"][:,:,0,0] = init_em
+    model.decoder.load_state_dict(model_dict)
+
+    return model
+
+class weightConstraint(object):
     def __init__(self):
         pass
     def __call__(self, module):
@@ -209,7 +204,7 @@ class Unmixing_from_features(nn.Module):
 
         # Upsampling features
         self.upsample = nn.Sequential(
-            nn.Linear(self.n_features*(self.alpha**2), self.H**2)
+            nn.Linear(self.alpha**2, self.H**2)
         )
 
         # Features to abundances
@@ -251,11 +246,14 @@ class Unmixing_from_features(nn.Module):
 
     def get_abundances(self, features):
 
-        features = features.reshape(self.D, self.n_features*self.alpha*self.alpha)
+        """Upsample the features"""
+        features = features.reshape(self.D, self.alpha*self.alpha)
         features_up = self.upsample(features)
         features_up = utils.oneD_to_2d(features_up)
         features_up = (features_up - features_up.mean())/ (1e-8 + features_up.std())
-        A_hat = self.abundance_estimator(features_up)
+
+        """Estimate the abundances from the upsampled features"""
+        A_hat = self.abundance_estimator(features_up.unsqueeze(0))
         A_hat = self.sum_to_one(A_hat)
 
         return A_hat
